@@ -77,6 +77,15 @@ input:focus,select:focus{border-color:var(--primary)}
 .gcal-section{margin-top:16px}
 .gcal-input{display:flex;gap:8px;align-items:center}
 .gcal-input input{flex:1;font-size:13px;padding:8px 10px}
+.paste-area{width:100%;min-height:80px;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;font-family:inherit;resize:vertical;outline:0}
+.paste-area:focus{border-color:var(--primary)}
+.paste-area::placeholder{color:var(--text-muted)}
+.line-import{border-color:rgba(6,199,85,.3);background:rgba(6,199,85,.03)}
+.line-event{display:flex;align-items:center;gap:8px;padding:8px 10px;background:var(--bg);border-radius:8px;margin-bottom:6px;font-size:13px;border-left:3px solid #06c755}
+.line-event .le-time{color:#06c755;font-weight:700;flex-shrink:0;min-width:100px}
+.sch-item.line{border-left-color:#06c755;background:rgba(6,199,85,.08)}
+.sch-item.line .tn{color:#6ee7a0}
+.badge-line{background:rgba(6,199,85,.2);color:#6ee7a0}
 </style><style id="claude-agent-animation-styles">
       @keyframes claude-pulse {
         0% {
@@ -783,6 +792,42 @@ const t2m=t=>{const[h,m]=t.split(':').map(Number);return h*60+m};
 const m2t=m=>{const h=Math.floor(m/60);const mn=m%60;return String(h).padStart(2,'0')+':'+String(mn).padStart(2,'0')};
 const fmt=s=>{const m=Math.floor(s/60);const sc=s%60;return String(m).padStart(2,'0')+':'+String(sc).padStart(2,'0')};
 
+// LINE予定テキストパーサー
+function parseLineSchedule(text){
+  const events=[];
+  // 【...の予定】ヘッダーと HH:MM〜HH:MM　タイトル のパターンを検出
+  const timePattern=/(\d{1,2}:\d{2})\s*[〜~\-]\s*(\d{1,2}:\d{2})\s*[　\s]+(.+?)(?=\d{1,2}:\d{2}\s*[〜~\-]|【|$)/g;
+  // テキストからヘッダーを除去して処理
+  const cleaned=text.replace(/【[^】]*】/g,' ');
+  let m;
+  while((m=timePattern.exec(cleaned))!==null){
+    const startStr=m[1].length===4?'0'+m[1]:m[1];
+    const endStr=m[2].length===4?'0'+m[2]:m[2];
+    const name=m[3].trim();
+    if(!name)continue;
+    const startMin=t2m(startStr);
+    const endMin=t2m(endStr);
+    if(endMin<=startMin)continue;
+    events.push({
+      id:'line-'+Date.now()+'-'+events.length,
+      name:name,
+      start:startStr,
+      end:endStr,
+      dur:endMin-startMin,
+      st:'pending',
+      line:true
+    });
+  }
+  // 重複除去（同じ開始時間+名前）
+  const seen=new Set();
+  return events.filter(e=>{
+    const key=e.start+e.name;
+    if(seen.has(key))return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 const GCAL_SCOPES='https://www.googleapis.com/auth/calendar.readonly';
 const GCAL_DISCOVERY='https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest';
 
@@ -915,6 +960,18 @@ function App(){
   useEffect(()=>{localStorage.setItem('tb-settings',JSON.stringify(settings))},[settings]);
 
   const gcal=useGoogleCalendar(settings.gcalClientId,settings.gcalAutoSync,settings.gcalSyncInterval);
+  const[lineEvents,setLineEvents]=useState([]);
+  const[showPaste,setShowPaste]=useState(false);
+  const[pasteText,setPasteText]=useState('');
+
+  const importLineEvents=()=>{
+    const parsed=parseLineSchedule(pasteText);
+    if(parsed.length===0)return;
+    setLineEvents(parsed);
+    setPasteText('');
+    setShowPaste(false);
+  };
+  const clearLineEvents=()=>setLineEvents([]);
 
   useEffect(()=>{if('Notification'in window&&Notification.permission!=='granted')Notification.requestPermission()},[]);
 
@@ -944,38 +1001,46 @@ function App(){
     if(settings.autoNext&&activeIdx+1<schedule.length)startTask(activeIdx+1);
   };
 
-  // Reminder notifications for upcoming events
+  // Reminder notifications for upcoming events (Google Calendar + LINE)
   const notifiedRef=useRef(new Set());
   useEffect(()=>{
-    if(!settings.notif||!settings.gcalAutoSync||!gcal.authed||gcal.events.length===0)return;
+    const allEvents=[...(gcal.authed?gcal.events:[]),...lineEvents];
+    if(!settings.notif||allEvents.length===0)return;
+    const reminderMin=settings.gcalReminderMin||5;
+    if(reminderMin===0)return;
     const checkReminders=()=>{
       const now=new Date();
       const nowMin=now.getHours()*60+now.getMinutes();
-      const reminderMin=settings.gcalReminderMin||5;
-      gcal.events.forEach(e=>{
+      allEvents.forEach(e=>{
         const eStart=t2m(e.start);
         const diff=eStart-nowMin;
         if(diff>0&&diff<=reminderMin&&!notifiedRef.current.has(e.id)){
           notifiedRef.current.add(e.id);
           if(settings.sound)beep();
-          notify('📅 まもなく予定',e.start+'〜 '+e.name+(e.location?' @ '+e.location:''));
+          const icon=e.line?'💬':'📅';
+          notify(icon+' まもなく予定',e.start+'〜 '+e.name+(e.location?' @ '+e.location:''));
         }
       });
     };
     checkReminders();
     const id=setInterval(checkReminders,30000);
     return()=>clearInterval(id);
-  },[gcal.events,gcal.authed,settings.notif,settings.gcalAutoSync,settings.gcalReminderMin,settings.sound]);
+  },[gcal.events,gcal.authed,lineEvents,settings.notif,settings.gcalReminderMin,settings.sound]);
 
   const addTodo=t=>{setTodos(p=>[...p,{id:Date.now(),...t}]);setShowAdd(false)};
   const delTodo=id=>setTodos(p=>p.filter(t=>t.id!==id));
 
-  const genSchedule=(useGcal=false)=>{
+  const genSchedule=(useGcal=false,useLine=false)=>{
     const sm=t2m(settings.start),em=t2m(settings.end),bd=settings.brk;
-    const calEvents=useGcal?gcal.events
+    const gcalEvts=useGcal?gcal.events
       .filter(e=>{const es=t2m(e.start),ee=t2m(e.end);return ee>sm&&es<em})
       .map(e=>({...e,start:m2t(Math.max(t2m(e.start),sm)),end:m2t(Math.min(t2m(e.end),em)),dur:Math.min(t2m(e.end),em)-Math.max(t2m(e.start),sm)}))
       .sort((a,b)=>t2m(a.start)-t2m(b.start)):[];
+    const lineEvts=useLine?lineEvents
+      .filter(e=>{const es=t2m(e.start),ee=t2m(e.end);return ee>sm&&es<em})
+      .map(e=>({...e,start:m2t(Math.max(t2m(e.start),sm)),end:m2t(Math.min(t2m(e.end),em)),dur:Math.min(t2m(e.end),em)-Math.max(t2m(e.start),sm)}))
+      .sort((a,b)=>t2m(a.start)-t2m(b.start)):[];
+    const calEvents=[...gcalEvts,...lineEvts].sort((a,b)=>t2m(a.start)-t2m(b.start));
 
     if(!todos.length&&!calEvents.length)return;
 
@@ -1028,8 +1093,9 @@ function App(){
 
   const totalMin=todos.reduce((s,t)=>s+(t.dur||25),0);
   const gcalMin=gcal.events.reduce((s,e)=>s+e.dur,0);
+  const lineMin=lineEvents.reduce((s,e)=>s+e.dur,0);
   const availMin=t2m(settings.end)-t2m(settings.start);
-  const freeMin=availMin-gcalMin;
+  const freeMin=availMin-gcalMin-lineMin;
 
   return React.createElement('div',{className:'app'},
     React.createElement('div',{className:'header'},
@@ -1063,7 +1129,26 @@ function App(){
           )),
           gcal.events.length>3&&React.createElement('div',{style:{fontSize:11,color:'var(--text-muted)',paddingTop:4}},'\u4ed6 '+(gcal.events.length-3)+'\u4ef6...')
         ),
-        (todos.length>0||gcal.events.length>0)&&React.createElement('div',{className:'card',style:{display:'flex',justifyContent:'space-between',alignItems:'center'}},
+        // LINE取り込みカード
+        React.createElement('div',{className:'card line-import',style:{marginBottom:12}},
+          React.createElement('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:lineEvents.length>0||showPaste?8:0}},
+            React.createElement('div',{style:{fontSize:13,fontWeight:700,color:'#06c755'}},'💬 LINE予定取り込み'+(lineEvents.length>0?' ('+lineEvents.length+'件)':'')),
+            React.createElement('div',{style:{display:'flex',gap:6}},
+              lineEvents.length>0&&React.createElement('button',{className:'btn btn-o',style:{fontSize:11,padding:'3px 8px',borderColor:'#ef4444',color:'#ef4444'},onClick:clearLineEvents},'クリア'),
+              React.createElement('button',{className:'btn btn-o',style:{fontSize:11,padding:'3px 8px',borderColor:'#06c755',color:'#06c755'},onClick:()=>setShowPaste(!showPaste)},showPaste?'閉じる':'貼り付け')
+            )
+          ),
+          showPaste&&React.createElement('div',{style:{marginBottom:8}},
+            React.createElement('textarea',{className:'paste-area',value:pasteText,onChange:e=>setPasteText(e.target.value),placeholder:'LINEの予定メッセージをここに貼り付け\n例: 08:00〜22:45　ブロック\n09:30〜10:00　面談リマインド',rows:4}),
+            React.createElement('button',{className:'btn btn-p',style:{width:'100%',marginTop:6,fontSize:13,background:'#06c755'},onClick:importLineEvents,disabled:!pasteText.trim()},'取り込む')
+          ),
+          lineEvents.length>0&&lineEvents.slice(0,5).map(e=>React.createElement('div',{key:e.id,className:'line-event'},
+            React.createElement('span',{className:'le-time'},e.start+'〜'+e.end),
+            React.createElement('span',{style:{flex:1,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}},e.name)
+          )),
+          lineEvents.length>5&&React.createElement('div',{style:{fontSize:11,color:'var(--text-muted)',paddingTop:4}},'他 '+(lineEvents.length-5)+'件...')
+        ),
+        (todos.length>0||gcal.events.length>0||lineEvents.length>0)&&React.createElement('div',{className:'card',style:{display:'flex',justifyContent:'space-between',alignItems:'center'}},
           React.createElement('div',null,
             React.createElement('div',{style:{fontSize:13,color:'var(--text-muted)'}},'\u5408\u8a08\u898b\u7a4d\u3082\u308a'),
             React.createElement('div',{style:{fontSize:20,fontWeight:700}},Math.floor(totalMin/60)+'h '+totalMin%60+'m',
@@ -1071,11 +1156,12 @@ function App(){
                 '/ '+Math.floor((gcal.authed?freeMin:availMin)/60)+'h'+(gcal.authed?freeMin:availMin)%60+'m\u5229\u7528\u53ef\u80fd'
               )
             ),
-            gcal.authed&&gcalMin>0&&React.createElement('div',{style:{fontSize:11,color:'#93b4f5',marginTop:2}},'(\u30ab\u30ec\u30f3\u30c0\u30fc\u4e88\u5b9a: '+Math.floor(gcalMin/60)+'h'+gcalMin%60+'m)')
+            gcal.authed&&gcalMin>0&&React.createElement('div',{style:{fontSize:11,color:'#93b4f5',marginTop:2}},'(\u30ab\u30ec\u30f3\u30c0\u30fc: '+Math.floor(gcalMin/60)+'h'+gcalMin%60+'m)'),
+            lineMin>0&&React.createElement('div',{style:{fontSize:11,color:'#06c755',marginTop:2}},'(LINE\u4e88\u5b9a: '+Math.floor(lineMin/60)+'h'+lineMin%60+'m)')
           ),
           React.createElement('div',{style:{display:'flex',flexDirection:'column',gap:6}},
-            gcal.authed&&gcal.events.length>0&&React.createElement('button',{className:'btn btn-p',onClick:()=>genSchedule(true),style:{fontSize:12,padding:'6px 12px',background:'#4285f4'}},'\ud83d\udcc5 \u30ab\u30ec\u30f3\u30c0\u30fc\u8fbc\u307f'),
-            React.createElement('button',{className:'btn btn-p',onClick:()=>genSchedule(false),style:{fontSize:12,padding:'6px 12px'}},'\u26a1 \u81ea\u52d5\u914d\u7f6e')
+            (lineEvents.length>0||(gcal.authed&&gcal.events.length>0))&&React.createElement('button',{className:'btn btn-p',onClick:()=>genSchedule(gcal.authed&&gcal.events.length>0,lineEvents.length>0),style:{fontSize:12,padding:'6px 12px',background:lineEvents.length>0?'#06c755':'#4285f4'}},(lineEvents.length>0?'\ud83d\udcac':'')+(gcal.authed&&gcal.events.length>0?'\ud83d\udcc5':'')+' \u4e88\u5b9a\u8fbc\u307f'),
+            React.createElement('button',{className:'btn btn-p',onClick:()=>genSchedule(false,false),style:{fontSize:12,padding:'6px 12px'}},'\u26a1 \u81ea\u52d5\u914d\u7f6e')
           )
         ),
         React.createElement('div',{className:'section-t'},'\u30bf\u30b9\u30af\u4e00\u89a7'),
@@ -1096,11 +1182,12 @@ function App(){
         schedule.length===0?React.createElement('div',{className:'empty'},React.createElement('div',{className:'ic'},'\ud83d\udcc5'),React.createElement('p',null,'Todo\u30bf\u30d6\u3067\u30bf\u30b9\u30af\u3092\u8ffd\u52a0\u3057\u3066',React.createElement('br'),'\u300c\u81ea\u52d5\u914d\u7f6e\u300d\u3092\u62bc\u3057\u3066\u304f\u3060\u3055\u3044')):
         React.createElement(React.Fragment,null,
           React.createElement('div',{className:'section-t'},'\u4eca\u65e5\u306e\u30bf\u30a4\u30e0\u30dc\u30c3\u30af\u30b9'),
-          schedule.map((item,idx)=>React.createElement('div',{key:item.id,className:'sch-item'+(item.gcal?' gcal':'')+(item.st==='active'?' active':'')+(item.st==='done'?' completed':''),onClick:()=>!item.gcal&&item.st==='pending'&&startTask(idx)},
+          schedule.map((item,idx)=>React.createElement('div',{key:item.id,className:'sch-item'+(item.gcal?' gcal':'')+(item.line?' line':'')+(item.st==='active'?' active':'')+(item.st==='done'?' completed':''),onClick:()=>!item.gcal&&!item.line&&item.st==='pending'&&startTask(idx)},
             React.createElement('div',{className:'sch-time'},React.createElement('div',{className:'t'},item.start),React.createElement('div',{className:'et'},item.end)),
             React.createElement('div',{className:'sch-content'},
-              React.createElement('div',{className:'tn'},(item.st==='done'?'\u2705 ':'')+(item.st==='active'?'\u25b6\ufe0f ':'')+(item.gcal?'\ud83d\udcc5 ':'')+item.name),
+              React.createElement('div',{className:'tn'},(item.st==='done'?'\u2705 ':'')+(item.st==='active'?'\u25b6\ufe0f ':'')+(item.gcal?'\ud83d\udcc5 ':'')+(item.line?'\ud83d\udcac ':'')+item.name),
               React.createElement('div',{className:'td'},item.dur+'\u5206',
+                item.line?React.createElement('span',{className:'badge badge-line',style:{marginLeft:8}},'LINE'):
                 item.gcal?React.createElement('span',{className:'badge badge-gcal',style:{marginLeft:8}},'Google Calendar'):
                 item.pri&&React.createElement('span',{className:'badge badge-'+(item.pri==='high'?'h':item.pri==='medium'?'m':'l'),style:{marginLeft:8}},item.pri==='high'?'\u9ad8':item.pri==='medium'?'\u4e2d':'\u4f4e'),
                 !item.gcal&&item.st==='pending'&&React.createElement('span',{style:{color:'var(--primary-light)',marginLeft:8}},'\u30bf\u30c3\u30d7\u3067\u958b\u59cb \u2192'),
